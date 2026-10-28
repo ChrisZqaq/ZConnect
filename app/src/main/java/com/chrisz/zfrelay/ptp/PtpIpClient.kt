@@ -1,0 +1,201 @@
+package com.chrisz.zfrelay.ptp
+
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
+import java.io.IOException
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.Socket
+
+internal class PtpException(message: String, val responseCode: Int? = null) : IOException(message)
+
+internal class PtpIpClient(
+    private val host: String,
+    private val port: Int = 15740,
+    private val socketFactory: () -> Socket = { Socket(Proxy.NO_PROXY) },
+    private val settleDelayMs: Long = 350,
+    private val socketTimeoutMs: Int = 30_000,
+) : Closeable {
+    private var commandSocket: Socket? = null
+    private var eventSocket: Socket? = null
+    private var transactionId = 0L
+
+    internal var connectionId: String = ""
+        private set
+
+    lateinit var deviceInfo: DeviceInfo
+        private set
+
+    private val initiatorGuid = byteArrayOf(
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88.toByte(), 0x99.toByte(), 0xaa.toByte(), 0xbb.toByte(),
+        0xcc.toByte(), 0xdd.toByte(), 0xee.toByte(), 0xff.toByte(),
+    )
+
+    @Synchronized
+    fun connect(): DeviceInfo {
+        close()
+        connectionId = java.util.UUID.randomUUID().toString()
+        var stage = "连接命令通道"
+        try {
+            val command = openSocket()
+            commandSocket = command
+            // Some Nikon Z bodies discard data sent immediately after the TCP handshake.
+            if (settleDelayMs > 0) Thread.sleep(settleDelayMs)
+            stage = "初始化命令通道"
+            command.getOutputStream().write(encodeInitCommandRequest(initiatorGuid, "zf-relay/0.1 (Android)"))
+            command.getOutputStream().flush()
+            val initResponse = readPacket(command.getInputStream())
+            if (initResponse.type == PacketType.INIT_FAIL) {
+                throw PtpException("连接被拒绝，请退出其他相机 App 后重试")
+            }
+            require(initResponse.type == PacketType.INIT_COMMAND_ACK) { "相机未返回 InitCommandAck" }
+            val ack = decodeInitCommandAck(initResponse.payload)
+
+            stage = "连接事件通道"
+            val event = openSocket()
+            eventSocket = event
+            if (settleDelayMs > 0) Thread.sleep(settleDelayMs)
+            stage = "初始化事件通道"
+            event.getOutputStream().write(encodeInitEventRequest(ack.connectionNumber))
+            event.getOutputStream().flush()
+            val eventResponse = readPacket(event.getInputStream())
+            if (eventResponse.type == PacketType.INIT_FAIL) {
+                throw PtpException("连接被拒绝，请退出其他相机 App 后重试")
+            }
+            require(eventResponse.type == PacketType.INIT_EVENT_ACK) { "相机未返回 InitEventAck" }
+
+            stage = "打开会话"
+            val session = transaction(OpCode.OPEN_SESSION, listOf(1), DataPhase.NONE)
+            if (session.response.responseCode !in setOf(ResponseCode.OK, ResponseCode.SESSION_ALREADY_OPEN)) {
+                throw PtpException("OpenSession 失败：${responseName(session.response.responseCode)}", session.response.responseCode)
+            }
+            stage = "读取相机信息"
+            deviceInfo = fetchDeviceInfo()
+            if (!deviceInfo.supportsPartialObject) {
+                throw PtpException("当前相机不受支持")
+            }
+            return deviceInfo
+        } catch (error: Exception) {
+            close()
+            throw PtpException(
+                "${stage}失败：${error.message ?: "请重试"}",
+                (error as? PtpException)?.responseCode,
+            )
+        }
+    }
+
+    @Synchronized
+    fun listPhotos(limit: Int = 120): Pair<Int, List<PhotoObject>> {
+        val handles = decodeU32Array(
+            checked(transaction(OpCode.GET_OBJECT_HANDLES, listOf(0xffffffffL, 0, 0)), "读取文件列表").data,
+        )
+        val photos = handles.asReversed().take(limit).map { handle ->
+            parseObjectInfo(
+                handle,
+                checked(transaction(OpCode.GET_OBJECT_INFO, listOf(handle)), "读取文件信息").data,
+            )
+        }
+        return handles.size to photos
+    }
+
+    @Synchronized
+    fun getThumbnail(handle: Long): ByteArray {
+        val large = transaction(OpCode.NIKON_GET_LARGE_THUMB, listOf(handle))
+        if (large.response.responseCode == ResponseCode.OK && large.data.isNotEmpty()) return large.data
+        return checked(transaction(OpCode.GET_THUMB, listOf(handle)), "读取缩略图").data
+    }
+
+    fun copyObject(
+        photo: PhotoObject,
+        startOffset: Long,
+        onChunk: (offset: Long, data: ByteArray) -> Unit,
+    ) {
+        var offset = startOffset
+        while (offset < photo.size) {
+            val wanted = minOf(CHUNK_SIZE.toLong(), photo.size - offset)
+            val result = checked(
+                transaction(OpCode.GET_PARTIAL_OBJECT, listOf(photo.handle, offset, wanted)),
+                "下载 ${photo.filename}",
+            )
+            if (result.data.isEmpty()) throw IOException("相机返回了空数据块，已保留断点")
+            if (result.data.size > wanted) throw IOException("相机返回的数据块超过请求长度")
+            onChunk(offset, result.data)
+            offset += result.data.size
+        }
+    }
+
+    @Synchronized
+    private fun transaction(opcode: Int, params: List<Long>, dataPhase: Int = DataPhase.DATA_IN): TransactionResult {
+        val socket = commandSocket ?: throw IOException("尚未连接相机，请重新连接")
+        val id = ++transactionId
+        try {
+            socket.getOutputStream().write(encodeOperationRequest(opcode, id, params, dataPhase))
+            socket.getOutputStream().flush()
+            val data = ByteArrayOutputStream()
+            while (true) {
+                val packet = readPacket(socket.getInputStream())
+                when (packet.type) {
+                    PacketType.START_DATA -> checkTransactionId(packet, id)
+                    PacketType.DATA, PacketType.END_DATA -> {
+                        checkTransactionId(packet, id)
+                        data.write(dataPayload(packet.payload))
+                    }
+                    PacketType.OPERATION_RESPONSE -> {
+                        val response = decodeOperationResponse(packet.payload)
+                        if (response.transactionId != id) {
+                            throw PtpException("响应事务编号不匹配：期望 $id，收到 ${response.transactionId}")
+                        }
+                        return TransactionResult(response, data.toByteArray())
+                    }
+                    PacketType.PROBE_REQUEST -> writePacket(socket.getOutputStream(), PacketType.PROBE_RESPONSE)
+                }
+            }
+        } catch (error: Exception) {
+            // A timed-out or malformed exchange may leave late packets on this TCP stream.
+            // Close both channels so the next request cannot consume a previous photo's data.
+            close()
+            throw error
+        }
+    }
+
+    private fun checkTransactionId(packet: PtpPacket, expected: Long) {
+        val actual = LittleEndianReader(packet.payload).u32()
+        if (actual != expected) {
+            throw PtpException("数据包事务编号不匹配：期望 $expected，收到 $actual")
+        }
+    }
+
+    private fun fetchDeviceInfo(): DeviceInfo =
+        parseDeviceInfo(checked(transaction(OpCode.GET_DEVICE_INFO, emptyList()), "读取相机信息").data)
+
+    private fun checked(result: TransactionResult, action: String): TransactionResult {
+        if (result.response.responseCode != ResponseCode.OK) {
+            throw PtpException("$action 失败：${responseName(result.response.responseCode)}", result.response.responseCode)
+        }
+        return result
+    }
+
+    private fun responseName(code: Int): String = "PTP 0x${code.toString(16).uppercase()}"
+
+    private fun openSocket(): Socket = socketFactory().apply {
+        receiveBufferSize = CHUNK_SIZE
+        tcpNoDelay = true
+        keepAlive = true
+        soTimeout = socketTimeoutMs
+        connect(InetSocketAddress(this@PtpIpClient.host, this@PtpIpClient.port), 10_000)
+    }
+
+    override fun close() {
+        runCatching { commandSocket?.close() }
+        runCatching { eventSocket?.close() }
+        commandSocket = null
+        eventSocket = null
+    }
+
+    private data class TransactionResult(val response: OperationResponse, val data: ByteArray)
+
+    companion object {
+        const val CHUNK_SIZE = 4 * 1024 * 1024
+    }
+}
